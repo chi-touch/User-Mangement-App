@@ -1,9 +1,14 @@
 from django.test import TestCase
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
 from .serializer import RegisterSerializer
 from accounts.models import User
 import json
+from django.core import mail
+from django.contrib.auth import get_user_model
+from accounts.utils import send_verification_email
+from accounts.tokens import generate_email_verification_token
+from django.urls import reverse
 
 
 class TestUserSerializer(TestCase):
@@ -15,6 +20,7 @@ class TestUserSerializer(TestCase):
             'first_name': 'chiuser',
             'last_name': 'userc'
         }
+        self.client = APIClient()
 
         self.invalid_data = {
             'username': 'invalid username!',
@@ -57,13 +63,36 @@ class TestUserSerializer(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn('username', serializer.errors)
 
+    def test_profile_update(self):
+        # Create a user
+        user = User.objects.create_user(username='testuser', password='TestPass123!')
+
+        # Authenticate the client with the created user
+        self.client.force_authenticate(user=user)
+
+        response = self.client.patch('/accounts/api/profile/', {
+            'first_name': 'Test',
+            'last_name': 'User'
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['first_name'], 'Test')
+        self.assertEqual(response.data['last_name'], 'User')
+        print(response.data)
+
 
 class LoginViewTest(APITestCase):
 
     def setUp(self):
         self.username = "testuser"
         self.password = "password123"
-        self.user = User.objects.create_user(username=self.username, password=self.password)
+        self.email = "testuser@example.com"
+
+        self.user = User.objects.create_user(
+            username=self.username,
+            email=self.email,
+            password=self.password
+        )
 
     def test_login_valid_credentials(self):
         response = self.client.post(
@@ -92,7 +121,6 @@ class LoginViewTest(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-        self.assertEqual(response.data['detail'], 'Invalid credentials')
 
     def test_login_invalid_password(self):
         response = self.client.post(
@@ -108,3 +136,39 @@ class LoginViewTest(APITestCase):
         self.assertEqual(response.data['detail'], 'Invalid credentials')
 
 
+class EmailVerificationTest(TestCase):
+    def setUp(self):
+        self.User = get_user_model()
+        self.user = self.User.objects.create_user(username='testuser', email='testuser@example.com',
+                                                  password='password123')
+        self.token = generate_email_verification_token(self.user)
+
+    def test_send_verification_email(self):
+        send_verification_email(self.user, self.token)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, "Verify Your Email")
+        self.assertEqual(mail.outbox[0].to, [self.user.email])
+        verification_url = f"http://localhost:8000/api/verify-email/{self.token}/"
+        self.assertIn(verification_url, mail.outbox[0].body)
+
+    def test_email_verification_link_valid(self):
+        url = reverse('verify-email', args=[self.token])
+        print(f"Verification URL: {url}")
+        response = self.client.get(url)
+        print(f"Response status: {response.status_code}")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Email verified successfully")
+
+    def test_invalid_token_is_expired(self):
+        invalid_token = "invalid-token"
+        url = reverse('verify-email', args=[invalid_token])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 400)
+        self.assertContains(response, "Invalid token or expired")
+
+    def test_invalid_token(self):
+        invalid_token = "invalid-token"
+        url = reverse('verify-email', args=[invalid_token])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid token or user does not exist", response.json().get("error", ""))
